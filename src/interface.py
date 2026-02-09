@@ -1,10 +1,45 @@
 import asyncio
 import time
 from collections.abc import Generator
+from pathlib import Path
 
+import nest_asyncio
 import streamlit as st
 
 from src.agents.rag_agent import stream_messages
+from src.core.database import database_connect
+from src.preprocessing.document_parser import parse_document
+from src.preprocessing.document_processor import process_and_embed_document
+
+# Allow nested event loops (needed for Streamlit + async)
+nest_asyncio.apply()
+
+DATA_DIR = Path(__file__).parent.parent / 'data'
+
+
+def get_or_create_event_loop() -> asyncio.AbstractEventLoop:
+    """Get the current event loop or create a new one."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+
+async def get_indexed_documents() -> list[str]:
+    """Fetch distinct document names from the database."""
+    async with database_connect() as pool:
+        rows = await pool.fetch(
+            'SELECT DISTINCT folder FROM repo ORDER BY folder'
+        )
+        return [row['folder'] for row in rows]
+
+
+async def delete_document(doc_name: str) -> None:
+    """Delete all embeddings for a document from the database."""
+    async with database_connect() as pool:
+        await pool.execute('DELETE FROM repo WHERE folder = $1', doc_name)
 
 
 async def stream_response(prompt: str) -> list[str]:
@@ -15,7 +50,159 @@ async def stream_response(prompt: str) -> list[str]:
     return message_chunks
 
 
-st.title('Chat RAG - Repositório GitHub')
+st.title('Chat RAG')
+
+# Track processed files to avoid re-embedding
+if 'processed_files' not in st.session_state:
+    st.session_state.processed_files = set()
+
+# Track skipped files (user clicked cancel) - cleared when uploader changes
+if 'skipped_files' not in st.session_state:
+    st.session_state.skipped_files = set()
+
+# Track pending file replacements
+if 'pending_replace' not in st.session_state:
+    st.session_state.pending_replace = None
+
+# Track previous uploaded file names to detect changes
+if 'prev_uploaded_names' not in st.session_state:
+    st.session_state.prev_uploaded_names = set()
+
+# Get existing documents once
+loop = get_or_create_event_loop()
+existing_docs = set(loop.run_until_complete(get_indexed_documents()))
+
+
+def process_file(file_path: Path, file_name: str, replace: bool = False) -> None:
+    """Process and embed a file, optionally replacing existing."""
+    if replace:
+        loop = get_or_create_event_loop()
+        loop.run_until_complete(delete_document(file_name))
+
+    loop = get_or_create_event_loop()
+    loop.run_until_complete(process_and_embed_document(file_path))
+    st.session_state.processed_files.add(file_name)
+
+
+# File upload section in sidebar
+with st.sidebar:
+    st.header('Upload Files')
+    uploaded_files = st.file_uploader(
+        'Upload documents to add to the knowledge base',
+        type=['txt', 'pdf', 'md', 'json', 'csv', 'docx', 'pptx', 'xlsx', 'html'],
+        accept_multiple_files=True,
+        key='file_uploader',
+    )
+
+    # Get current uploaded file names
+    current_names = {f.name for f in uploaded_files} if uploaded_files else set()
+
+    # Clear skipped files that are no longer in the uploader
+    # This allows re-uploading a previously skipped file
+    removed_files = st.session_state.prev_uploaded_names - current_names
+    for removed in removed_files:
+        st.session_state.skipped_files.discard(removed)
+    st.session_state.prev_uploaded_names = current_names
+
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            # Skip already processed or skipped in this session
+            if uploaded_file.name in st.session_state.processed_files:
+                continue
+            if uploaded_file.name in st.session_state.skipped_files:
+                continue
+
+            file_path = DATA_DIR / uploaded_file.name
+            with open(file_path, 'wb') as f:
+                f.write(uploaded_file.getbuffer())
+
+            # Check if document already exists in DB
+            if uploaded_file.name in existing_docs:
+                st.session_state.pending_replace = {
+                    'name': uploaded_file.name,
+                    'path': file_path,
+                }
+            else:
+                with st.spinner(f'Processing {uploaded_file.name}...'):
+                    try:
+                        process_file(file_path, uploaded_file.name)
+                        st.success(
+                            f'Processed and embedded: {uploaded_file.name}'
+                        )
+                    except Exception as e:
+                        st.error(f'Error processing {uploaded_file.name}: {e}')
+
+    # Replace confirmation dialog
+    if st.session_state.pending_replace:
+        pending = st.session_state.pending_replace
+        name = pending['name']
+        path = pending['path']
+
+        @st.dialog(f'Replace "{name}"?')
+        def confirm_replace() -> None:
+            st.write(
+                f'**{name}** already exists in the knowledge base. '
+                'Do you want to replace it?'
+            )
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button('Cancel', use_container_width=True):
+                    st.session_state.pending_replace = None
+                    st.session_state.skipped_files.add(name)
+                    st.rerun()
+            with col2:
+                if st.button('Replace', type='primary', use_container_width=True):
+                    process_file(path, name, replace=True)
+                    st.session_state.pending_replace = None
+                    st.rerun()
+
+        confirm_replace()
+
+    # Show indexed documents
+    st.divider()
+    st.header('Indexed Documents')
+    try:
+        loop = get_or_create_event_loop()
+        documents = loop.run_until_complete(get_indexed_documents())
+        if documents:
+            for doc in documents:
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    st.text(f'📄 {doc}')
+                with col2:
+                    if st.button('🗑️', key=f'del_{doc}', help=f'Delete {doc}'):
+                        st.session_state.doc_to_delete = doc
+
+            # Confirmation dialog
+            if 'doc_to_delete' in st.session_state:
+                doc = st.session_state.doc_to_delete
+
+                @st.dialog(f'Delete "{doc}"?')
+                def confirm_delete() -> None:
+                    st.write(
+                        f'Are you sure you want to delete **{doc}**? '
+                        'This will remove all embeddings for this document.'
+                    )
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button('Cancel', use_container_width=True):
+                            del st.session_state.doc_to_delete
+                            st.rerun()
+                    with col2:
+                        if st.button(
+                            'Delete', type='primary', use_container_width=True
+                        ):
+                            loop = get_or_create_event_loop()
+                            loop.run_until_complete(delete_document(doc))
+                            st.session_state.processed_files.discard(doc)
+                            del st.session_state.doc_to_delete
+                            st.rerun()
+
+                confirm_delete()
+        else:
+            st.info('No documents indexed yet.')
+    except Exception as e:
+        st.error(f'Could not load documents: {e}')
 
 if 'messages' not in st.session_state:
     st.session_state.messages = []
@@ -38,7 +225,8 @@ if prompt := st.chat_input('What is up?'):
             `.write_stream` doesn't support async.
             """
             assert prompt, "Variable 'prompt' is empty or not set!"
-            messages = asyncio.run(stream_response(prompt))
+            loop = get_or_create_event_loop()
+            messages = loop.run_until_complete(stream_response(prompt))
 
             for message in messages:
                 yield message

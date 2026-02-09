@@ -1,9 +1,7 @@
 import asyncio
+import asyncpg
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-
-import asyncpg
-
 from src.core.settings import settings
 
 

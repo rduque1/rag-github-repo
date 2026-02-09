@@ -175,15 +175,3 @@ def num_tokens_from_string(
 
     return num_tokens
 
-
-if __name__ == '__main__':
-    folder = 'data'
-    input_file_name = 'source.txt'
-    output_file_name = 'data_chunks.json'
-
-    input_file = os.path.join(folder, input_file_name)
-
-    split_data = split_in_root_folders(input_file)
-    grouped_data = aggregate_files_by_token(split_data)
-
-    save_as_json(grouped_data, folder, file_name=output_file_name)

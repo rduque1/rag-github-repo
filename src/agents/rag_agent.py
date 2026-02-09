@@ -1,63 +1,78 @@
 """
-RAG example from LangChain using pgvector as database
-
-Documents from the repository of Jornada de Dados
+RAG agent using Azure OpenAI with pgvector as database.
 """
-
 import asyncio
 import sys
-from collections.abc import AsyncGenerator
-from dataclasses import dataclass
-
 import asyncpg
 import pydantic_core
-from openai import AsyncOpenAI
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass
+from openai import AsyncAzureOpenAI
 from pydantic_ai import RunContext
 from pydantic_ai.agent import Agent
-
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
 from src.core.database import database_connect
+from src.core.settings import settings
 
 
 @dataclass
 class Deps:
-    openai: AsyncOpenAI
+    openai: AsyncAzureOpenAI
     pool: asyncpg.Pool
 
 
 system_prompt = """
-Você é um agente da Jornada de Dados, uma comunidade que ensina projetos
-práticos de engenharia de dados. Sua função é responder sobre o material
-que está no repositório da jornada. Você irá receber o noma da pasta raiz e
-parte do conteudo que esta nela. Sobras as pastas:
-- Se tiver algum numero no nomae da pasta, se trata to númerpo do Workshops
-que foi ministrado.
-- As que tivrerem Bootcamp são de Bootcamps
-- O resto são aulas normais.
+# ROLE
+You are a helpful AI Assistant that answers questions based on the user's uploaded documents.
 
-Use a função `retrieve` para buscra resultados a respeito da pergunta do
-usuário
+# RULES
+1. ONLY use the retrieved document context to answer. Do not make up information.
+2. If the answer is not found in the documents, say: "I couldn't find information about that in the uploaded documents."
+3. Cite the source document name when providing information, e.g., [document.pdf].
+4. Be concise and direct in your responses.
+5. If the question is unclear, ask for clarification.
+
+# PROCESS
+1. Use the retrieve tool to search the document database for relevant content.
+2. Analyze the retrieved context to find the answer.
+3. Provide a clear answer with source citations.
 """
 
+
+# Configure Azure OpenAI provider for pydantic-ai
+azure_client = AsyncAzureOpenAI(
+    azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
+    api_key=settings.AZURE_OPENAI_API_KEY,
+    api_version=settings.AZURE_OPENAI_API_VERSION,
+)
+
+model = OpenAIChatModel(
+    model_name=settings.AZURE_CHAT_DEPLOYMENT,
+    provider=OpenAIProvider(openai_client=azure_client),
+)
+
+# Create the agent with the Azure model
 agent = Agent(
-    'openai:gpt-3.5-turbo',
+    model,
+    output_type=str,
     system_prompt=system_prompt,
     deps_type=Deps,
-    result_type=str,
 )
 
 
 @agent.tool
 async def retrieve(context: RunContext[Deps], search_query: str) -> str:
-    """Retrieve documentation sections based on a search query.
+    """Retrieve relevant document sections based on a search query.
 
     Args:
         context: The call context.
-        search_query: The search query.
+        search_query: The search query to find relevant documents.
     """
 
     response = await context.deps.openai.embeddings.create(
         input=search_query,
-        model='text-embedding-3-small',
+        model=settings.AZURE_EMBEDDING_DEPLOYMENT,
     )
 
     embedding = response.data[0].embedding
@@ -65,22 +80,29 @@ async def retrieve(context: RunContext[Deps], search_query: str) -> str:
     rows = await context.deps.pool.fetch(
         """
         SELECT folder, content FROM repo
-        ORDER BY embedding <=> $1 LIMIT 1
+        ORDER BY embedding <=> $1 LIMIT 5
         """,
         embedding_json,
     )
 
-    return '\n\n'.join(f'Conteudo:\n{row["content"]}\n' for row in rows)
+    if not rows:
+        return "No documents found in the knowledge base."
+
+    results = []
+    for row in rows:
+        source = row["folder"]
+        content = row["content"]
+        results.append(f"[Source: {source}]\n{content}")
+
+    return '\n\n---\n\n'.join(results)
 
 
 async def stream_messages(question: str) -> AsyncGenerator[str, None]:
     """
     Stream messages for Streamlit interface.
     """
-    openai = AsyncOpenAI()
-
     async with database_connect() as pool:
-        deps = Deps(openai=openai, pool=pool)
+        deps = Deps(openai=azure_client, pool=pool)
         async with agent.run_stream(question, deps=deps) as result:
             async for message in result.stream_text(delta=True):
                 yield message
@@ -90,10 +112,8 @@ async def run_agent(question: str) -> None:
     """
     Entry point to run the agent and perform RAG based question answering.
     """
-    openai = AsyncOpenAI()
-
     async with database_connect() as pool:
-        deps = Deps(openai=openai, pool=pool)
+        deps = Deps(openai=azure_client, pool=pool)
         answer = await agent.run(question, deps=deps)
 
     print(answer.data)

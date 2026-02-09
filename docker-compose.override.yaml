@@ -1,0 +1,7 @@
+services:
+  streamlit:
+    volumes:
+      - ./src:/app/src:ro
+      - ./data:/app/data
+    environment:
+      - STREAMLIT_SERVER_RUN_ON_SAVE=true
