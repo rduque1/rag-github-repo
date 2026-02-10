@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     AZURE_EMBEDDING_DEPLOYMENT: str = 'text-embedding-3-small'
     AZURE_CHAT_DEPLOYMENT: str = 'gpt-4o'
 
+    # Code executor settings
+    PYTHON_EXECUTOR_URL: str = 'http://localhost:5000'
+    NODEJS_EXECUTOR_URL: str = 'http://localhost:3000'
+
 
 settings = Settings()
 

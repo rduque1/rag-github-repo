@@ -7,7 +7,7 @@ from pathlib import Path
 import nest_asyncio
 import streamlit as st
 
-from src.agents.assistant_agent import stream_messages
+from src.agents.assistant_agent import stream_messages, update_memory
 from src.core.database import database_connect
 from src.preprocessing.document_parser import parse_document
 from src.preprocessing.document_processor import process_and_embed_document
@@ -58,9 +58,10 @@ async def stream_response(
     prompt: str,
     selected_docs: list[str] | None = None,
     message_history: list[dict[str, str]] | None = None,
+    memory: str | None = None,
 ) -> list[str]:
     message_chunks: list[str] = []
-    async for chunk in stream_messages(prompt, selected_docs, message_history):
+    async for chunk in stream_messages(prompt, selected_docs, message_history, memory):
         message_chunks.append(chunk)
 
     return message_chunks
@@ -260,6 +261,10 @@ with st.sidebar:
 if 'messages' not in st.session_state:
     st.session_state.messages = []
 
+# Initialize conversation memory
+if 'memory' not in st.session_state:
+    st.session_state.memory = None
+
 for message in st.session_state.messages:
     with st.chat_message(message['role']):
         st.markdown(message['content'])
@@ -269,6 +274,10 @@ if prompt := st.chat_input('What is up?'):
 
     with st.chat_message('user'):
         st.markdown(prompt)
+
+    # Get document count before response (to detect new docs added by agent)
+    loop = get_or_create_event_loop()
+    docs_before = set(loop.run_until_complete(get_indexed_documents()))
 
     with st.chat_message('assistant'):
 
@@ -283,8 +292,10 @@ if prompt := st.chat_input('What is up?'):
             selected = st.session_state.get('selected_docs') or None
             # Pass message history for context (exclude current message)
             history = st.session_state.messages[:-1] if st.session_state.messages else []
+            # Pass conversation memory
+            memory = st.session_state.get('memory')
             messages = loop.run_until_complete(
-                stream_response(prompt, selected, history)
+                stream_response(prompt, selected, history, memory)
             )
 
             for message in messages:
@@ -297,3 +308,18 @@ if prompt := st.chat_input('What is up?'):
         'role': 'assistant',
         'content': response,
     })
+
+    # Update memory with the new exchange (in background)
+    loop = get_or_create_event_loop()
+    try:
+        new_memory = loop.run_until_complete(
+            update_memory(st.session_state.memory, prompt, response)
+        )
+        st.session_state.memory = new_memory
+    except Exception:
+        pass  # Don't fail the chat if memory update fails
+
+    # Refresh sidebar if new documents were added to KB by the agent
+    docs_after = set(loop.run_until_complete(get_indexed_documents()))
+    if docs_after != docs_before:
+        st.rerun()

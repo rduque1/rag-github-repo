@@ -3,9 +3,14 @@ Assistant agent using Azure OpenAI with pgvector as database.
 Supports document search, summarization, listing, and web search.
 """
 import asyncio
+import re
 import sys
+from urllib.parse import urlparse
+
 import asyncpg
+import httpx
 import pydantic_core
+import trafilatura
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from openai import AsyncAzureOpenAI
@@ -23,34 +28,62 @@ class Deps:
     openai: AsyncAzureOpenAI
     pool: asyncpg.Pool
     selected_docs: list[str] | None = None  # Filter to specific documents
+    last_fetched_url: str | None = None  # Track last URL for "save it" commands
+    memory: str | None = None  # Summarized conversation context
 
 
 system_prompt = """
 # ROLE
-You are a helpful AI Assistant that works with the user's uploaded documents and can also search the web.
+You are a helpful AI Assistant that works with the user's uploaded documents and can also search and scrape the web. You can execute Python and JavaScript code.
+
+# MEMORY
+You have access to a memory of key facts from the conversation. Check the `get_memory` tool at the start to recall important context.
 
 # INTENT UNDERSTANDING
 First, understand what the user wants to do:
-- **Search/Question**: User wants to find specific information or ask a question about the documents → use `retrieve` tool
-- **Summarize**: User wants a summary of one or more documents → use `summarize_documents` tool
+- **Search/Question**: User wants to find specific information → use `retrieve` tool
+- **Summarize**: User wants a summary of documents → use `summarize_documents` tool
 - **List**: User wants to know what documents are available → use `list_documents` tool
-- **Compare**: User wants to compare information across documents → use `retrieve` multiple times with different queries
-- **Web Search**: User wants information not in the documents or asks about external topics → use `duckduckgo_search` tool
+- **Compare**: User wants to compare information → use `retrieve` multiple times
+- **Web Search**: User wants external information → use `duckduckgo_search` tool
+- **Fetch URL**: User provides a URL to read → use `fetch_webpage` tool
+- **Save last webpage**: User confirms saving a previously fetched page → use `save_last_webpage_to_kb` tool
+- **Run Python code**: User wants to execute Python → use `execute_python_code` tool
+- **Run JavaScript code**: User wants to execute JavaScript/Node.js → use `execute_nodejs_code` tool
+- **Math/Statistics/Calculations**: Any numerical task → use `execute_python_code` tool
+
+# CRITICAL: USE CODE EXECUTION FOR CALCULATIONS
+For ANY task involving:
+- Mathematical calculations (arithmetic, algebra, percentages, etc.)
+- Statistical analysis (mean, median, standard deviation, correlations, etc.)
+- Data processing or transformations
+- Date/time calculations
+- Numerical comparisons or sorting
+- Financial calculations
+
+→ **ALWAYS use `execute_python_code`** instead of calculating in your head.
+→ Use numpy/pandas for complex operations.
+→ This ensures accuracy and avoids calculation errors.
+
+# CRITICAL: SAVING WEBPAGES TO KNOWLEDGE BASE
+When user says "yes", "save it", "add it", "add to knowledge base" after you showed them a webpage:
+→ **ALWAYS use `save_last_webpage_to_kb` tool** (no parameters needed, it remembers the URL)
+→ Do NOT ask for the URL again
+
+# CODE EXECUTION
+- Python: Available packages include numpy, pandas, requests, httpx, pydantic
+- JavaScript: Available built-in modules include path, url, querystring, util, crypto
+- Use print()/console.log() for output
+- Code runs in isolated sandboxed containers
 
 # RULES
 1. First try to answer from documents. If not found, offer to search the web.
-2. When using document info, cite the source document name, e.g., [document.pdf].
-3. When using web search, cite the source URL.
-4. Be concise and direct in your responses.
-5. If the query is unclear, ask for clarification.
-
-# EXAMPLES
-- "What does the document say about X?" → Search intent → use `retrieve`
-- "Summarize the main points" → Summarize intent → use `summarize_documents`
-- "What files do I have?" → List intent → use `list_documents`
-- "Compare X in document A vs B" → Compare intent → use `retrieve` for each topic
-- "What is the latest news about Y?" → Web search intent → use `duckduckgo_search`
-- "Search the web for Z" → Web search intent → use `duckduckgo_search`
+2. When using document info, cite the source document name.
+3. When using web search or fetched pages, cite the source URL.
+4. Be concise and direct.
+5. NEVER ask for a URL that was already discussed.
+6. Use memory context to maintain continuity in the conversation.
+7. For any calculation, use code execution - don't do mental math.
 """
 
 
@@ -66,6 +99,33 @@ model = OpenAIChatModel(
     provider=OpenAIProvider(openai_client=azure_client),
 )
 
+# Memory agent - responsible for extracting key facts from conversations
+memory_agent = Agent(
+    model,
+    output_type=str,
+    system_prompt="""You are a memory extraction agent. Your job is to maintain a concise summary of key facts from a conversation.
+
+Given the current memory (if any) and the latest exchange, update the memory with:
+- Key facts mentioned by the user (name, preferences, topics of interest)
+- Important decisions or conclusions reached
+- URLs discussed and their status (fetched, saved to KB, etc.)
+- Any context needed for future turns
+
+Rules:
+- Output as bullet points (use - for each point)
+- Keep only RELEVANT information (remove outdated or superseded facts)
+- Be concise - max 20 bullet points
+- If a fact is updated, replace the old version
+- Remove trivial exchanges (greetings, confirmations)
+- If nothing important, return the existing memory unchanged
+
+Format:
+- [fact 1]
+- [fact 2]
+...""",
+)
+
+
 # Create the agent with the Azure model
 agent = Agent(
     model,
@@ -74,6 +134,17 @@ agent = Agent(
     deps_type=Deps,
     tools=[duckduckgo_search_tool()],
 )
+
+
+@agent.tool
+def get_memory(context: RunContext[Deps]) -> str:
+    """Get the conversation memory containing key facts from previous exchanges.
+
+    Use this at the start of your response to recall important context.
+    """
+    if context.deps.memory:
+        return f"Conversation memory:\n{context.deps.memory}"
+    return "No previous conversation memory."
 
 
 @agent.tool
@@ -284,10 +355,359 @@ async def summarize_documents(
     return await _hierarchical_summarize(context.deps.openai, chunks)
 
 
+async def _embed_and_store_webpage(
+    pool: asyncpg.Pool,
+    openai: AsyncAzureOpenAI,
+    url: str,
+    title: str,
+    content: str,
+) -> int:
+    """Embed webpage content and store in database."""
+    from src.preprocessing.document_processor import embed_chunks
+
+    # Split content into chunks (similar to document_processor)
+    chunk_size = 1000
+    chunks = []
+    words = content.split()
+    current_chunk = []
+    current_size = 0
+
+    for word in words:
+        current_chunk.append(word)
+        current_size += len(word) + 1
+        if current_size >= chunk_size:
+            chunks.append(' '.join(current_chunk))
+            current_chunk = []
+            current_size = 0
+
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+
+    if not chunks:
+        return 0
+
+    # Use URL as the document name (folder), or title if available
+    doc_name = title if title else urlparse(url).netloc + urlparse(url).path
+    doc_name = doc_name[:100]  # Limit length
+
+    # Embed and store (embed_chunks creates its own pool/openai internally)
+    await embed_chunks(doc_name, chunks)
+    return len(chunks)
+
+
+@agent.tool
+async def fetch_webpage(
+    context: RunContext[Deps],
+    url: str,
+    save_to_kb: bool = False,
+) -> str:
+    """Fetch and extract content from a webpage.
+
+    Use this when the user provides a URL to read, summarize, or analyze.
+    Can optionally save the webpage to the knowledge base.
+
+    Args:
+        context: The call context.
+        url: The URL to fetch.
+        save_to_kb: If True, saves the webpage content to the knowledge base.
+            Use this when the user asks to "add", "save", or "store" a URL.
+    """
+    # Browser-like headers to avoid bot detection
+    headers = {
+        'User-Agent': (
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/120.0.0.0 Safari/537.36'
+        ),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+    }
+
+    try:
+        # Fetch the page with browser-like settings
+        async with httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True,
+            http2=True,
+        ) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            html = response.text
+
+        # Extract main content using trafilatura
+        extracted = trafilatura.extract(
+            html,
+            include_comments=False,
+            include_tables=True,
+            no_fallback=False,
+        )
+
+        if not extracted:
+            return (
+                f"Could not extract readable content from {url}. "
+                "The page might require JavaScript or have anti-bot protection. "
+                "You can paste the article text directly and I'll help analyze it."
+            )
+
+        # Get metadata
+        metadata = trafilatura.extract_metadata(html)
+        title = metadata.title if metadata and metadata.title else urlparse(url).netloc
+
+        # Store URL in deps for later "save it" commands
+        context.deps.last_fetched_url = url
+
+        # Save to knowledge base if requested
+        if save_to_kb:
+            chunks_stored = await _embed_and_store_webpage(
+                context.deps.pool,
+                context.deps.openai,
+                url,
+                title,
+                extracted,
+            )
+            return (
+                f"Successfully fetched and saved [{title}]({url}) to knowledge base "
+                f"({chunks_stored} chunks stored).\n\n"
+                f"**Content Preview:**\n{extracted[:2000]}{'...' if len(extracted) > 2000 else ''}"
+            )
+
+        # Return content for summarization/analysis
+        return (
+            f"**Source:** [{title}]({url})\n\n"
+            f"**Content:**\n{extracted}"
+        )
+
+    except httpx.HTTPStatusError as e:
+        return (
+            f"Failed to fetch {url}: HTTP {e.response.status_code}. "
+            "The site may be blocking automated requests. "
+            "Try pasting the article text directly."
+        )
+    except httpx.TimeoutException:
+        return (
+            f"Request to {url} timed out. "
+            "The site may be slow or blocking requests. "
+            "Try pasting the article text directly."
+        )
+    except httpx.HTTPError as e:
+        return (
+            f"Failed to fetch {url}: {e}. "
+            "Try pasting the article text directly and I'll help analyze it."
+        )
+    except Exception as e:
+        return f"Error processing {url}: {e}. Try pasting the article text directly."
+
+
+@agent.tool
+async def save_last_webpage_to_kb(context: RunContext[Deps]) -> str:
+    """Save the last fetched webpage to the knowledge base.
+
+    Use this when the user confirms they want to save a webpage that was
+    just shown to them. For example, when user says "yes", "save it",
+    "add it to kb", "add to knowledge base" after viewing a webpage.
+
+    This tool remembers the last URL that was fetched, so you don't need
+    to ask the user for the URL again.
+    """
+    # First check deps for the URL (set during this session)
+    url = context.deps.last_fetched_url
+
+    # If not in deps, try to find URL in recent conversation
+    if not url:
+        return (
+            "I don't have a recently fetched webpage to save. "
+            "Please provide the URL you'd like me to add to the knowledge base."
+        )
+
+    # Fetch and save the webpage
+    headers = {
+        'User-Agent': (
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/120.0.0.0 Safari/537.36'
+        ),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True,
+            http2=True,
+        ) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            html = response.text
+
+        extracted = trafilatura.extract(
+            html,
+            include_comments=False,
+            include_tables=True,
+            no_fallback=False,
+        )
+
+        if not extracted:
+            return f"Could not extract content from {url} for saving."
+
+        metadata = trafilatura.extract_metadata(html)
+        title = metadata.title if metadata and metadata.title else urlparse(url).netloc
+
+        chunks_stored = await _embed_and_store_webpage(
+            context.deps.pool,
+            context.deps.openai,
+            url,
+            title,
+            extracted,
+        )
+
+        return (
+            f"✓ Successfully saved [{title}]({url}) to your knowledge base "
+            f"({chunks_stored} chunks stored). It will now appear in your document list."
+        )
+
+    except Exception as e:
+        return f"Failed to save webpage: {e}"
+
+
+@agent.tool
+async def execute_python_code(context: RunContext[Deps], code: str) -> str:
+    """Execute Python code in a sandboxed container.
+
+    Use this when the user asks you to run Python code, perform calculations,
+    data processing, or test Python snippets.
+
+    Available packages: numpy, pandas, requests, httpx, pydantic, python-dateutil
+
+    Args:
+        context: The call context.
+        code: The Python code to execute. Use print() to show output.
+              Assign result to '_result' variable for return value.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{settings.PYTHON_EXECUTOR_URL}/execute",
+                json={"code": code},
+            )
+            response.raise_for_status()
+            result = response.json()
+
+        output_parts = []
+        if result.get("stdout"):
+            output_parts.append(f"**Output:**\n```\n{result['stdout']}\n```")
+        if result.get("stderr"):
+            output_parts.append(f"**Stderr:**\n```\n{result['stderr']}\n```")
+        if result.get("return_value"):
+            output_parts.append(f"**Return value:** `{result['return_value']}`")
+        if result.get("error"):
+            output_parts.append(f"**Error:**\n```\n{result['error']}\n```")
+
+        if not output_parts:
+            return "Code executed successfully (no output)."
+
+        return "\n\n".join(output_parts)
+
+    except httpx.ConnectError:
+        return "Error: Python executor is not available. Make sure the container is running."
+    except Exception as e:
+        return f"Error executing Python code: {e}"
+
+
+@agent.tool
+async def execute_nodejs_code(context: RunContext[Deps], code: str) -> str:
+    """Execute Node.js/JavaScript code in a sandboxed container.
+
+    Use this when the user asks you to run JavaScript code, perform calculations,
+    or test JavaScript snippets.
+
+    Available built-in modules: path, url, querystring, util, crypto
+
+    Args:
+        context: The call context.
+        code: The JavaScript code to execute. Use console.log() to show output.
+              The last expression value is automatically returned.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{settings.NODEJS_EXECUTOR_URL}/execute",
+                json={"code": code},
+            )
+            response.raise_for_status()
+            result = response.json()
+
+        output_parts = []
+        if result.get("stdout"):
+            output_parts.append(f"**Output:**\n```\n{result['stdout']}\n```")
+        if result.get("stderr"):
+            output_parts.append(f"**Stderr:**\n```\n{result['stderr']}\n```")
+        if result.get("return_value"):
+            output_parts.append(f"**Return value:** `{result['return_value']}`")
+        if result.get("error"):
+            output_parts.append(f"**Error:**\n```\n{result['error']}\n```")
+
+        if not output_parts:
+            return "Code executed successfully (no output)."
+
+        return "\n\n".join(output_parts)
+
+    except httpx.ConnectError:
+        return "Error: Node.js executor is not available. Make sure the container is running."
+    except Exception as e:
+        return f"Error executing JavaScript code: {e}"
+
+
+def _extract_urls_from_history(messages: list[tuple[str, str]]) -> str | None:
+    """Extract the most recent URL from message history."""
+    url_pattern = r'https?://[^\s\]\)\"\'<>]+'
+
+    # Search from most recent to oldest
+    for _, content in reversed(messages):
+        urls = re.findall(url_pattern, content)
+        if urls:
+            return urls[-1]  # Return the last URL found in that message
+    return None
+
+
+async def update_memory(
+    current_memory: str | None,
+    user_message: str,
+    assistant_response: str,
+) -> str:
+    """
+    Use the memory agent to update conversation memory with new exchange.
+
+    Args:
+        current_memory: The current memory state (bullet points).
+        user_message: The latest user message.
+        assistant_response: The assistant's response.
+
+    Returns:
+        Updated memory as bullet points.
+    """
+    prompt = f"""Current memory:
+{current_memory or "(empty)"}
+
+Latest exchange:
+User: {user_message}
+Assistant: {assistant_response[:1000]}{"..." if len(assistant_response) > 1000 else ""}
+
+Update the memory with any important new facts. Return the updated bullet points."""
+
+    result = await memory_agent.run(prompt)
+    return result.output
+
+
 async def stream_messages(
     question: str,
     selected_docs: list[str] | None = None,
     message_history: list[dict[str, str]] | None = None,
+    memory: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Stream messages for Streamlit interface.
@@ -297,9 +717,15 @@ async def stream_messages(
         selected_docs: Optional list of document names to limit search to.
         message_history: Optional list of previous messages for context.
             Each message is a dict with 'role' and 'content' keys.
+        memory: Optional summarized memory from previous exchanges.
     """
     async with database_connect() as pool:
-        deps = Deps(openai=azure_client, pool=pool, selected_docs=selected_docs)
+        deps = Deps(
+            openai=azure_client,
+            pool=pool,
+            selected_docs=selected_docs,
+            memory=memory,
+        )
 
         # Build message history for the agent
         messages: list[tuple[str, str]] = []
@@ -311,6 +737,11 @@ async def stream_messages(
                     messages.append(('user', content))
                 elif role == 'assistant':
                     messages.append(('assistant', content))
+
+        # Extract last URL from history and set in deps
+        last_url = _extract_urls_from_history(messages)
+        if last_url:
+            deps.last_fetched_url = last_url
 
         async with agent.run_stream(
             question, deps=deps, message_history=messages
