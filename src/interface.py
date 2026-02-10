@@ -1,12 +1,13 @@
 import asyncio
 import time
+import warnings
 from collections.abc import Generator
 from pathlib import Path
 
 import nest_asyncio
 import streamlit as st
 
-from src.agents.rag_agent import stream_messages
+from src.agents.assistant_agent import stream_messages
 from src.core.database import database_connect
 from src.preprocessing.document_parser import parse_document
 from src.preprocessing.document_processor import process_and_embed_document
@@ -14,17 +15,28 @@ from src.preprocessing.document_processor import process_and_embed_document
 # Allow nested event loops (needed for Streamlit + async)
 nest_asyncio.apply()
 
+# Suppress unclosed event loop warnings (expected with nest_asyncio + streamlit)
+warnings.filterwarnings('ignore', message='unclosed event loop')
+
 DATA_DIR = Path(__file__).parent.parent / 'data'
+
+
+# Create a single persistent event loop for the session
+@st.cache_resource
+def get_event_loop() -> asyncio.AbstractEventLoop:
+    """Get or create a persistent event loop."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    return loop
 
 
 def get_or_create_event_loop() -> asyncio.AbstractEventLoop:
     """Get the current event loop or create a new one."""
     try:
-        return asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
     except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        return loop
+        loop = get_event_loop()
+    return loop
 
 
 async def get_indexed_documents() -> list[str]:
@@ -42,9 +54,13 @@ async def delete_document(doc_name: str) -> None:
         await pool.execute('DELETE FROM repo WHERE folder = $1', doc_name)
 
 
-async def stream_response(prompt: str) -> list[str]:
+async def stream_response(
+    prompt: str,
+    selected_docs: list[str] | None = None,
+    message_history: list[dict[str, str]] | None = None,
+) -> list[str]:
     message_chunks: list[str] = []
-    async for chunk in stream_messages(prompt):
+    async for chunk in stream_messages(prompt, selected_docs, message_history):
         message_chunks.append(chunk)
 
     return message_chunks
@@ -132,6 +148,19 @@ with st.sidebar:
                     except Exception as e:
                         st.error(f'Error processing {uploaded_file.name}: {e}')
 
+    # Process file replacement if confirmed
+    if st.session_state.get('confirmed_replace'):
+        replace_info = st.session_state.confirmed_replace
+        name = replace_info['name']
+        path = replace_info['path']
+        with st.spinner(f'Replacing {name}...'):
+            try:
+                process_file(path, name, replace=True)
+                st.success(f'Replaced and embedded: {name}')
+            except Exception as e:
+                st.error(f'Error replacing {name}: {e}')
+        st.session_state.confirmed_replace = None
+
     # Replace confirmation dialog
     if st.session_state.pending_replace:
         pending = st.session_state.pending_replace
@@ -152,7 +181,10 @@ with st.sidebar:
                     st.rerun()
             with col2:
                 if st.button('Replace', type='primary', use_container_width=True):
-                    process_file(path, name, replace=True)
+                    st.session_state.confirmed_replace = {
+                        'name': name,
+                        'path': path,
+                    }
                     st.session_state.pending_replace = None
                     st.rerun()
 
@@ -161,10 +193,31 @@ with st.sidebar:
     # Show indexed documents
     st.divider()
     st.header('Indexed Documents')
+
+    # Initialize selected docs in session state
+    if 'selected_docs' not in st.session_state:
+        st.session_state.selected_docs = []
+
     try:
         loop = get_or_create_event_loop()
         documents = loop.run_until_complete(get_indexed_documents())
         if documents:
+            # Document filter multiselect
+            selected = st.multiselect(
+                'Filter RAG to specific documents:',
+                options=documents,
+                default=st.session_state.selected_docs,
+                placeholder='All documents (no filter)',
+            )
+            st.session_state.selected_docs = selected
+
+            if selected:
+                st.caption(f'RAG limited to {len(selected)} document(s)')
+            else:
+                st.caption('RAG searching all documents')
+
+            st.divider()
+
             for doc in documents:
                 col1, col2 = st.columns([4, 1])
                 with col1:
@@ -226,7 +279,13 @@ if prompt := st.chat_input('What is up?'):
             """
             assert prompt, "Variable 'prompt' is empty or not set!"
             loop = get_or_create_event_loop()
-            messages = loop.run_until_complete(stream_response(prompt))
+            # Pass selected documents filter (None if empty list)
+            selected = st.session_state.get('selected_docs') or None
+            # Pass message history for context (exclude current message)
+            history = st.session_state.messages[:-1] if st.session_state.messages else []
+            messages = loop.run_until_complete(
+                stream_response(prompt, selected, history)
+            )
 
             for message in messages:
                 yield message
