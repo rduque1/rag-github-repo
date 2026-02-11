@@ -30,6 +30,7 @@ class Deps:
     selected_docs: list[str] | None = None  # Filter to specific documents
     last_fetched_url: str | None = None  # Track last URL for "save it" commands
     memory: str | None = None  # Summarized conversation context
+    generated_images: list[str] | None = None  # Store base64 images from code execution
 
 
 system_prompt = """
@@ -71,10 +72,17 @@ When user says "yes", "save it", "add it", "add to knowledge base" after you sho
 → Do NOT ask for the URL again
 
 # CODE EXECUTION
-- Python: Available packages include numpy, pandas, requests, httpx, pydantic
+- Python: Available packages include numpy, pandas, matplotlib, requests, httpx, pydantic
 - JavaScript: Available built-in modules include path, url, querystring, util, crypto
 - Use print()/console.log() for output
 - Code runs in isolated sandboxed containers
+- **PLOTTING RULES** (CRITICAL):
+  - plt is pre-imported, just use it directly
+  - NEVER use plt.savefig() - the system strips these automatically
+  - NEVER reference /mnt/data or file paths - they don't exist
+  - Just create plot and call plt.show()
+  - The tool response will contain the image as base64 - it displays automatically
+  - DO NOT write your own ![image](path) markdown - the image is already in the tool response
 
 # RULES
 1. First try to answer from documents. If not found, offer to search the web.
@@ -579,20 +587,56 @@ async def execute_python_code(context: RunContext[Deps], code: str) -> str:
     """Execute Python code in a sandboxed container.
 
     Use this when the user asks you to run Python code, perform calculations,
-    data processing, or test Python snippets.
+    data processing, create visualizations, or test Python snippets.
 
-    Available packages: numpy, pandas, requests, httpx, pydantic, python-dateutil
+    Available packages: numpy, pandas, matplotlib, requests, httpx, pydantic
+
+    IMPORTANT PLOTTING RULES:
+    - plt is already imported for you
+    - NEVER use plt.savefig() - it won't work
+    - NEVER reference file paths or attachments
+    - NEVER use display() or Image()
+    - Just create your plot and end with plt.show()
+    - The system automatically captures the figure as base64
+    - DO NOT write markdown image tags yourself - the system returns the image
+
+    Correct plotting example:
+    ```
+    import numpy as np
+    x = np.linspace(0, 10, 100)
+    y = np.sin(x)
+    plt.figure(figsize=(10, 6))
+    plt.plot(x, y)
+    plt.title('Sine Wave')
+    plt.xlabel('x')
+    plt.ylabel('sin(x)')
+    plt.show()
+    ```
 
     Args:
         context: The call context.
-        code: The Python code to execute. Use print() to show output.
-              Assign result to '_result' variable for return value.
+        code: The Python code to execute. Use print() for text output.
+              For plots: just create the figure and call plt.show().
     """
+    # Remove any savefig calls from the code to prevent file-saving patterns
+    import re as regex
+    cleaned_code = regex.sub(
+        r'plt\.savefig\([^)]*\)',
+        '# savefig removed - figures are captured automatically',
+        code
+    )
+    # Also remove any /mnt/data references
+    cleaned_code = regex.sub(
+        r'["\'][^"\']*(/mnt/data|/tmp)[^"\']*["\']',
+        '"/dev/null"',
+        cleaned_code
+    )
+
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 f"{settings.PYTHON_EXECUTOR_URL}/execute",
-                json={"code": code},
+                json={"code": cleaned_code},
             )
             response.raise_for_status()
             result = response.json()
@@ -606,6 +650,14 @@ async def execute_python_code(context: RunContext[Deps], code: str) -> str:
             output_parts.append(f"**Return value:** `{result['return_value']}`")
         if result.get("error"):
             output_parts.append(f"**Error:**\n```\n{result['error']}\n```")
+
+        # Store images in deps instead of returning them to LLM (saves tokens)
+        images = result.get("images", [])
+        if images:
+            if context.deps.generated_images is None:
+                context.deps.generated_images = []
+            context.deps.generated_images.extend(images)
+            output_parts.append(f"**Generated Plot(s):** {len(images)} image(s) created successfully.")
 
         if not output_parts:
             return "Code executed successfully (no output)."
@@ -708,7 +760,7 @@ async def stream_messages(
     selected_docs: list[str] | None = None,
     message_history: list[dict[str, str]] | None = None,
     memory: str | None = None,
-) -> AsyncGenerator[str, None]:
+) -> AsyncGenerator[str | dict, None]:
     """
     Stream messages for Streamlit interface.
 
@@ -718,6 +770,9 @@ async def stream_messages(
         message_history: Optional list of previous messages for context.
             Each message is a dict with 'role' and 'content' keys.
         memory: Optional summarized memory from previous exchanges.
+
+    Yields:
+        Either a string chunk of text, or a dict with 'images' key containing base64 images.
     """
     async with database_connect() as pool:
         deps = Deps(
@@ -748,6 +803,10 @@ async def stream_messages(
         ) as result:
             async for message in result.stream_text(delta=True):
                 yield message
+
+        # After streaming completes, yield any generated images
+        if deps.generated_images:
+            yield {"images": deps.generated_images}
 
 
 async def run_agent(question: str) -> None:

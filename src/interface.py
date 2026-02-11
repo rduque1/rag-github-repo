@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import sys
 import time
 import warnings
 from collections.abc import Generator
@@ -59,12 +61,19 @@ async def stream_response(
     selected_docs: list[str] | None = None,
     message_history: list[dict[str, str]] | None = None,
     memory: str | None = None,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
+    """Stream response from agent, returning text chunks and any generated images."""
     message_chunks: list[str] = []
-    async for chunk in stream_messages(prompt, selected_docs, message_history, memory):
-        message_chunks.append(chunk)
+    images: list[str] = []
 
-    return message_chunks
+    async for chunk in stream_messages(prompt, selected_docs, message_history, memory):
+        if isinstance(chunk, dict) and 'images' in chunk:
+            # This is the images payload at the end
+            images = chunk['images']
+        else:
+            message_chunks.append(chunk)
+
+    return message_chunks, images
 
 
 st.title('Chat RAG')
@@ -269,6 +278,15 @@ for message in st.session_state.messages:
     with st.chat_message(message['role']):
         st.markdown(message['content'])
 
+        # Render any stored images for this message
+        if 'images' in message and message['images']:
+            for i, img_base64 in enumerate(message['images']):
+                try:
+                    img_bytes = base64.b64decode(img_base64)
+                    st.image(img_bytes, caption=f"Generated Plot {i + 1}")
+                except Exception:
+                    pass
+
 if prompt := st.chat_input('What is up?'):
     st.session_state.messages.append({'role': 'user', 'content': prompt})
 
@@ -278,6 +296,9 @@ if prompt := st.chat_input('What is up?'):
     # Get document count before response (to detect new docs added by agent)
     loop = get_or_create_event_loop()
     docs_before = set(loop.run_until_complete(get_indexed_documents()))
+
+    # Store images from agent - use a mutable container for closure access
+    image_container: dict[str, list[str]] = {"images": []}
 
     with st.chat_message('assistant'):
 
@@ -294,9 +315,10 @@ if prompt := st.chat_input('What is up?'):
             history = st.session_state.messages[:-1] if st.session_state.messages else []
             # Pass conversation memory
             memory = st.session_state.get('memory')
-            messages = loop.run_until_complete(
+            messages, images = loop.run_until_complete(
                 stream_response(prompt, selected, history, memory)
             )
+            image_container["images"] = images
 
             for message in messages:
                 yield message
@@ -304,9 +326,19 @@ if prompt := st.chat_input('What is up?'):
 
         response = st.write_stream(stream_sync)
 
+        # Render any generated images from code execution
+        for i, img_base64 in enumerate(image_container["images"]):
+            try:
+                img_bytes = base64.b64decode(img_base64)
+                st.image(img_bytes, caption=f"Generated Plot {i + 1}")
+            except Exception:
+                pass
+
+    generated_images = image_container["images"]
     st.session_state.messages.append({
         'role': 'assistant',
         'content': response,
+        'images': generated_images,
     })
 
     # Update memory with the new exchange (in background)
