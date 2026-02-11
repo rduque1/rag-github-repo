@@ -90,7 +90,7 @@ You have access to a memory of key facts from the conversation. Check the `get_m
 # INTENT UNDERSTANDING
 First, understand what the user wants to do:
 - **Search/Question**: User wants to find specific information → use `retrieve` tool
-- **Summarize**: User wants a summary of documents → use `summarize_documents` tool
+- **Summarize**: User wants a summary of documents → use `summarize_documents` tool (no document_name needed if documents are pre-selected)
 - **List**: User wants to know what documents are available → use `list_documents` tool
 - **Compare**: User wants to compare information → use `retrieve` multiple times
 - **Web Search**: User wants external information → use `duckduckgo_search` tool
@@ -99,6 +99,12 @@ First, understand what the user wants to do:
 - **Run Python code**: User wants to execute Python → use `execute_python_code` tool
 - **Run JavaScript code**: User wants to execute JavaScript/Node.js → use `execute_nodejs_code` tool
 - **Math/Statistics/Calculations**: Any numerical task → use `execute_python_code` tool
+
+# SELECTED DOCUMENTS
+If the user's message includes "[Context: User has selected these documents: ...]", these documents are pre-selected in the UI.
+- For `retrieve`, `summarize_documents`, and `list_documents`: they will automatically use only these selected documents
+- Do NOT ask for the document name - just call the tool directly
+- The tools know which documents are selected
 
 # CRITICAL: USE CODE EXECUTION FOR CALCULATIONS
 For ANY task involving:
@@ -276,10 +282,10 @@ async def list_documents(context: RunContext[Deps]) -> str:
 MAX_SUMMARY_TOKENS = 6000
 
 
-async def _summarize_chunk(openai: AsyncAzureOpenAI, chunk: str, source: str) -> str:
+async def _summarize_chunk(openai: AsyncOpenAI | AsyncAzureOpenAI, chunk: str, source: str) -> str:
     """Generate a summary for a single chunk of content."""
     response = await openai.chat.completions.create(
-        model=settings.AZURE_CHAT_DEPLOYMENT,
+        model=settings.LLM_CHAT_MODEL,
         messages=[
             {
                 'role': 'system',
@@ -300,7 +306,7 @@ async def _summarize_chunk(openai: AsyncAzureOpenAI, chunk: str, source: str) ->
 
 
 async def _hierarchical_summarize(
-    openai: AsyncAzureOpenAI,
+    openai: AsyncOpenAI | AsyncAzureOpenAI,
     chunks: list[tuple[str, str]],  # List of (source, content)
 ) -> str:
     """
@@ -409,7 +415,7 @@ async def summarize_documents(
 
 async def _embed_and_store_webpage(
     pool: asyncpg.Pool,
-    openai: AsyncAzureOpenAI,
+    openai: AsyncOpenAI | AsyncAzureOpenAI,
     url: str,
     title: str,
     content: str,
@@ -845,8 +851,14 @@ async def stream_messages(
         if last_url:
             deps.last_fetched_url = last_url
 
+        # Add context about selected documents to the question
+        augmented_question = question
+        if selected_docs:
+            docs_list = ', '.join(selected_docs)
+            augmented_question = f"[Context: User has selected these documents: {docs_list}]\n\n{question}"
+
         async with agent.run_stream(
-            question, deps=deps, message_history=messages
+            augmented_question, deps=deps, message_history=messages
         ) as result:
             async for message in result.stream_text(delta=True):
                 yield message
