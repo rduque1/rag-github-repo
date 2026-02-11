@@ -776,11 +776,7 @@ def _extract_urls_from_history(messages: list[tuple[str, str]]) -> str | None:
     return None
 
 
-async def update_memory(
-    current_memory: str | None,
-    user_message: str,
-    assistant_response: str,
-) -> str:
+async def update_memory(current_memory: str | None, user_message: str, assistant_response: str) -> str:
     """
     Use the memory agent to update conversation memory with new exchange.
 
