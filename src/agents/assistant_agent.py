@@ -1,19 +1,17 @@
-"""
-Assistant agent using Azure OpenAI with pgvector as database.
+"""Assistant agent with configurable LLM backend (Azure, Ollama, LM Studio).
 Supports document search, summarization, listing, and web search.
 """
 import asyncio
 import re
 import sys
-from urllib.parse import urlparse
-
 import asyncpg
 import httpx
 import pydantic_core
 import trafilatura
+from urllib.parse import urlparse
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
-from openai import AsyncAzureOpenAI
+from openai import AsyncAzureOpenAI, AsyncOpenAI
 from pydantic_ai import RunContext
 from pydantic_ai.agent import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -23,10 +21,59 @@ from src.core.database import database_connect
 from src.core.settings import settings
 
 
+def _create_llm_client() -> tuple[AsyncOpenAI | AsyncAzureOpenAI, str]:
+    """Create the appropriate LLM client based on settings."""
+    provider = settings.LLM_PROVIDER
+
+    if provider == 'azure':
+        client = AsyncAzureOpenAI(
+            azure_endpoint=settings.LLM_BASE_URL,
+            api_key=settings.LLM_API_KEY,
+            api_version=settings.LLM_API_VERSION,
+        )
+        return client, settings.LLM_CHAT_MODEL
+
+    # OpenAI, Ollama, and LM Studio all use OpenAI-compatible API
+    base_url = settings.LLM_BASE_URL
+    if provider == 'ollama' and not base_url.endswith('/v1'):
+        base_url = f"{base_url}/v1"
+
+    client = AsyncOpenAI(
+        base_url=base_url,
+        api_key=settings.LLM_API_KEY or 'not-needed',
+    )
+    return client, settings.LLM_CHAT_MODEL
+
+
+def _create_embedding_client() -> tuple[AsyncOpenAI | AsyncAzureOpenAI, str]:
+    """Create the appropriate embedding client based on settings."""
+    provider = settings.LLM_PROVIDER
+
+    if provider == 'azure':
+        client = AsyncAzureOpenAI(
+            azure_endpoint=settings.LLM_BASE_URL,
+            api_key=settings.LLM_API_KEY,
+            api_version=settings.LLM_API_VERSION,
+        )
+        return client, settings.LLM_EMBEDDING_MODEL
+
+    # OpenAI, Ollama, and LM Studio all use OpenAI-compatible API
+    base_url = settings.LLM_BASE_URL
+    if provider == 'ollama' and not base_url.endswith('/v1'):
+        base_url = f"{base_url}/v1"
+
+    client = AsyncOpenAI(
+        base_url=base_url,
+        api_key=settings.LLM_API_KEY or 'not-needed',
+    )
+    return client, settings.LLM_EMBEDDING_MODEL
+
+
 @dataclass
 class Deps:
-    openai: AsyncAzureOpenAI
+    openai: AsyncOpenAI | AsyncAzureOpenAI
     pool: asyncpg.Pool
+    embedding_model: str  # Model name for embeddings
     selected_docs: list[str] | None = None  # Filter to specific documents
     last_fetched_url: str | None = None  # Track last URL for "save it" commands
     memory: str | None = None  # Summarized conversation context
@@ -72,10 +119,11 @@ When user says "yes", "save it", "add it", "add to knowledge base" after you sho
 → Do NOT ask for the URL again
 
 # CODE EXECUTION
-- Python: Available packages include numpy, pandas, matplotlib, requests, httpx, pydantic
+- Python: Available packages include numpy, pandas, matplotlib, openpyxl, requests, httpx, pydantic
 - JavaScript: Available built-in modules include path, url, querystring, util, crypto
 - Use print()/console.log() for output
 - Code runs in isolated sandboxed containers
+- For Excel files (.xlsx): use pandas with openpyxl (e.g., pd.read_excel(), df.to_excel())
 - **PLOTTING RULES** (CRITICAL):
   - plt is pre-imported, just use it directly
   - NEVER use plt.savefig() - the system strips these automatically
@@ -95,16 +143,12 @@ When user says "yes", "save it", "add it", "add to knowledge base" after you sho
 """
 
 
-# Configure Azure OpenAI provider for pydantic-ai
-azure_client = AsyncAzureOpenAI(
-    azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
-    api_key=settings.AZURE_OPENAI_API_KEY,
-    api_version=settings.AZURE_OPENAI_API_VERSION,
-)
+# Configure LLM provider (Azure, Ollama, or LM Studio based on settings)
+llm_client, chat_model_name = _create_llm_client()
 
 model = OpenAIChatModel(
-    model_name=settings.AZURE_CHAT_DEPLOYMENT,
-    provider=OpenAIProvider(openai_client=azure_client),
+    model_name=chat_model_name,
+    provider=OpenAIProvider(openai_client=llm_client),
 )
 
 # Memory agent - responsible for extracting key facts from conversations
@@ -166,7 +210,7 @@ async def retrieve(context: RunContext[Deps], search_query: str) -> str:
 
     response = await context.deps.openai.embeddings.create(
         input=search_query,
-        model=settings.AZURE_EMBEDDING_DEPLOYMENT,
+        model=context.deps.embedding_model,
     )
 
     embedding = response.data[0].embedding
@@ -774,10 +818,13 @@ async def stream_messages(
     Yields:
         Either a string chunk of text, or a dict with 'images' key containing base64 images.
     """
+    embedding_client, embedding_model = _create_embedding_client()
+
     async with database_connect() as pool:
         deps = Deps(
-            openai=azure_client,
+            openai=embedding_client,
             pool=pool,
+            embedding_model=embedding_model,
             selected_docs=selected_docs,
             memory=memory,
         )
@@ -813,8 +860,14 @@ async def run_agent(question: str) -> None:
     """
     Entry point to run the agent and perform RAG based question answering.
     """
+    embedding_client, embedding_model = _create_embedding_client()
+
     async with database_connect() as pool:
-        deps = Deps(openai=azure_client, pool=pool)
+        deps = Deps(
+            openai=embedding_client,
+            pool=pool,
+            embedding_model=embedding_model,
+        )
         answer = await agent.run(question, deps=deps)
 
     print(answer.data)

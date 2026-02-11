@@ -14,15 +14,14 @@ async def database_connect() -> AsyncGenerator[asyncpg.Pool, None]:
         await pool.close()
 
 
-DB_SCHEMA = """
+DB_SCHEMA = f"""
 CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS repo (
     id serial PRIMARY KEY,
     folder text NOT NULL,
     content text NOT NULL,
-    -- text-embedding-3-small returns a vector of 1536 floats
-    embedding vector(1536) NOT NULL
+    embedding vector({settings.LLM_EMBEDDING_DIMENSIONS}) NOT NULL
 );
 
 CREATE INDEX

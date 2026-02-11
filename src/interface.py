@@ -115,7 +115,7 @@ with st.sidebar:
     st.header('Upload Files')
     uploaded_files = st.file_uploader(
         'Upload documents to add to the knowledge base',
-        type=['txt', 'pdf', 'md', 'json', 'csv', 'docx', 'pptx', 'xlsx', 'html'],
+        type=['txt', 'pdf', 'md', 'json', 'csv', 'docx', 'pptx', 'xlsx', 'html', 'tsv'],
         accept_multiple_files=True,
         key='file_uploader',
     )
@@ -156,6 +156,8 @@ with st.sidebar:
                             f'Processed and embedded: {uploaded_file.name}'
                         )
                     except Exception as e:
+                        import traceback
+                        traceback.print_exc()
                         st.error(f'Error processing {uploaded_file.name}: {e}')
 
     # Process file replacement if confirmed
@@ -168,6 +170,8 @@ with st.sidebar:
                 process_file(path, name, replace=True)
                 st.success(f'Replaced and embedded: {name}')
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 st.error(f'Error replacing {name}: {e}')
         st.session_state.confirmed_replace = None
 

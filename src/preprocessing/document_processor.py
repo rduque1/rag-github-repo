@@ -1,13 +1,11 @@
-"""
-Document processor that parses files with docling and creates embeddings.
-"""
+"""Document processor that parses files with docling and creates embeddings."""
 
 import asyncio
 from pathlib import Path
 
 import asyncpg
 import pydantic_core
-from openai import AsyncAzureOpenAI
+from openai import AsyncAzureOpenAI, AsyncOpenAI
 
 from src.core.database import database_connect
 from src.core.settings import settings
@@ -16,6 +14,30 @@ from src.preprocessing.chunk_splitter import (
     num_tokens_from_string,
 )
 from src.preprocessing.document_parser import parse_document
+
+
+def _create_embedding_client() -> tuple[AsyncOpenAI | AsyncAzureOpenAI, str]:
+    """Create the appropriate embedding client based on settings."""
+    provider = settings.LLM_PROVIDER
+
+    if provider == 'azure':
+        client = AsyncAzureOpenAI(
+            azure_endpoint=settings.LLM_BASE_URL,
+            api_key=settings.LLM_API_KEY,
+            api_version=settings.LLM_API_VERSION,
+        )
+        return client, settings.LLM_EMBEDDING_MODEL
+
+    # OpenAI, Ollama, and LM Studio all use OpenAI-compatible API
+    base_url = settings.LLM_BASE_URL
+    if provider == 'ollama' and not base_url.endswith('/v1'):
+        base_url = f"{base_url}/v1"
+
+    client = AsyncOpenAI(
+        base_url=base_url,
+        api_key=settings.LLM_API_KEY or 'not-needed',
+    )
+    return client, settings.LLM_EMBEDDING_MODEL
 
 
 async def process_and_embed_document(
@@ -87,50 +109,52 @@ async def _embed_and_store(source_name: str, chunks: list[str]) -> None:
 
 
 async def embed_chunks(source_name: str, chunks: list[str]) -> None:
-    """
-    Create embeddings for chunks and store them in the database.
+    """Create embeddings for chunks and store them in the database.
 
     This is the single source of truth for embedding logic.
 
     :param source_name: Name of the source document.
     :param chunks: List of text chunks to embed.
     """
-    openai = AsyncAzureOpenAI(
-        azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
-        api_key=settings.AZURE_OPENAI_API_KEY,
-        api_version=settings.AZURE_OPENAI_API_VERSION,
-    )
+    openai, embedding_model = _create_embedding_client()
 
     async with database_connect() as pool:
         sem = asyncio.Semaphore(10)
 
-        async with asyncio.TaskGroup() as tg:
-            for chunk in chunks:
-                tg.create_task(
-                    _insert_embedding(sem, openai, pool, source_name, chunk)
-                )
+        try:
+            async with asyncio.TaskGroup() as tg:
+                for chunk in chunks:
+                    tg.create_task(
+                        _insert_embedding(sem, openai, pool, source_name, chunk, embedding_model)
+                    )
+        except ExceptionGroup as eg:
+            # Log all sub-exceptions for debugging
+            for exc in eg.exceptions:
+                print(f"Embedding error: {exc}")
+            raise eg.exceptions[0] from eg  # Re-raise first exception with context
 
 
 async def _insert_embedding(
     sem: asyncio.Semaphore,
-    openai: AsyncAzureOpenAI,
+    openai: AsyncOpenAI | AsyncAzureOpenAI,
     pool: asyncpg.Pool,
     source_name: str,
     content: str,
+    embedding_model: str,
 ) -> None:
-    """
-    Create and insert a single embedding into the database.
+    """Create and insert a single embedding into the database.
 
     :param sem: Semaphore for rate limiting.
-    :param openai: Azure OpenAI client.
+    :param openai: OpenAI-compatible client.
     :param pool: Database connection pool.
     :param source_name: Name of the source document.
     :param content: Text content to embed.
+    :param embedding_model: Name of the embedding model to use.
     """
     async with sem:
         response = await openai.embeddings.create(
             input=content,
-            model=settings.AZURE_EMBEDDING_DEPLOYMENT,
+            model=embedding_model,
         )
 
         embedding = response.data[0].embedding
