@@ -12,6 +12,7 @@ dependencies = [
     "mypy>=1.14.1",
     "nest-asyncio>=1.6.0",
     "pgvector>=0.3.6",
+    "playwright>=1.58.0",
     "pydantic-ai>=0.0.14",
     "pydantic-settings>=2.7.1",
     "ruff>=0.8.4",

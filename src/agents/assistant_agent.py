@@ -2,8 +2,10 @@
 Supports document search, summarization, listing, and web search.
 """
 import asyncio
+import logging
 import re
 import sys
+import traceback
 import asyncpg
 import httpx
 import pydantic_core
@@ -19,6 +21,8 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
 from src.core.database import database_connect
 from src.core.settings import settings
+
+logger = logging.getLogger(__name__)
 
 
 def _create_llm_client() -> tuple[AsyncOpenAI | AsyncAzureOpenAI, str]:
@@ -470,6 +474,7 @@ async def fetch_webpage(
         save_to_kb: If True, saves the webpage content to the knowledge base.
             Use this when the user asks to "add", "save", or "store" a URL.
     """
+    logger.info(f"fetch_webpage called: url={url}, save_to_kb={save_to_kb}")
     # Browser-like headers to avoid bot detection
     headers = {
         'User-Agent': (
@@ -487,6 +492,7 @@ async def fetch_webpage(
 
     try:
         # Fetch the page with browser-like settings
+        logger.info(f"Fetching {url}...")
         async with httpx.AsyncClient(
             timeout=30.0,
             follow_redirects=True,
@@ -495,6 +501,7 @@ async def fetch_webpage(
             response = await client.get(url, headers=headers)
             response.raise_for_status()
             html = response.text
+        logger.info(f"Fetched {url}, got {len(html)} chars of HTML")
 
         # Extract main content using trafilatura
         extracted = trafilatura.extract(
@@ -505,12 +512,14 @@ async def fetch_webpage(
         )
 
         if not extracted:
+            logger.warning(f"Could not extract content from {url}")
             return (
                 f"Could not extract readable content from {url}. "
                 "The page might require JavaScript or have anti-bot protection. "
                 "You can paste the article text directly and I'll help analyze it."
             )
 
+        logger.info(f"Extracted {len(extracted)} chars from {url}")
         # Get metadata
         metadata = trafilatura.extract_metadata(html)
         title = metadata.title if metadata and metadata.title else urlparse(url).netloc
@@ -520,6 +529,7 @@ async def fetch_webpage(
 
         # Save to knowledge base if requested
         if save_to_kb:
+            logger.info(f"Saving {url} to knowledge base...")
             chunks_stored = await _embed_and_store_webpage(
                 context.deps.pool,
                 context.deps.openai,
@@ -527,6 +537,7 @@ async def fetch_webpage(
                 title,
                 extracted,
             )
+            logger.info(f"Saved {chunks_stored} chunks for {url}")
             return (
                 f"Successfully fetched and saved [{title}]({url}) to knowledge base "
                 f"({chunks_stored} chunks stored).\n\n"
@@ -540,23 +551,29 @@ async def fetch_webpage(
         )
 
     except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error fetching {url}: {e.response.status_code}")
         return (
             f"Failed to fetch {url}: HTTP {e.response.status_code}. "
             "The site may be blocking automated requests. "
             "Try pasting the article text directly."
         )
     except httpx.TimeoutException:
+        logger.error(f"Timeout fetching {url}")
         return (
             f"Request to {url} timed out. "
             "The site may be slow or blocking requests. "
             "Try pasting the article text directly."
         )
     except httpx.HTTPError as e:
+        logger.error(f"HTTP error fetching {url}: {e}")
+        logger.error(traceback.format_exc())
         return (
             f"Failed to fetch {url}: {e}. "
             "Try pasting the article text directly and I'll help analyze it."
         )
     except Exception as e:
+        logger.error(f"Error processing {url}: {e}")
+        logger.error(traceback.format_exc())
         return f"Error processing {url}: {e}. Try pasting the article text directly."
 
 
@@ -820,48 +837,56 @@ async def stream_messages(
     Yields:
         Either a string chunk of text, or a dict with 'images' key containing base64 images.
     """
+    logger.info(f"stream_messages called: question={question[:100]}...")
     embedding_client, embedding_model = _create_embedding_client()
 
-    async with database_connect() as pool:
-        deps = Deps(
-            openai=embedding_client,
-            pool=pool,
-            embedding_model=embedding_model,
-            selected_docs=selected_docs,
-            memory=memory,
-        )
+    try:
+        async with database_connect() as pool:
+            deps = Deps(
+                openai=embedding_client,
+                pool=pool,
+                embedding_model=embedding_model,
+                selected_docs=selected_docs,
+                memory=memory,
+            )
 
-        # Build message history for the agent
-        messages: list[tuple[str, str]] = []
-        if message_history:
-            for msg in message_history:
-                role = msg.get('role', '')
-                content = msg.get('content', '')
-                if role == 'user':
-                    messages.append(('user', content))
-                elif role == 'assistant':
-                    messages.append(('assistant', content))
+            # Build message history for the agent
+            messages: list[tuple[str, str]] = []
+            if message_history:
+                for msg in message_history:
+                    role = msg.get('role', '')
+                    content = msg.get('content', '')
+                    if role == 'user':
+                        messages.append(('user', content))
+                    elif role == 'assistant':
+                        messages.append(('assistant', content))
 
-        # Extract last URL from history and set in deps
-        last_url = _extract_urls_from_history(messages)
-        if last_url:
-            deps.last_fetched_url = last_url
+            # Extract last URL from history and set in deps
+            last_url = _extract_urls_from_history(messages)
+            if last_url:
+                deps.last_fetched_url = last_url
 
-        # Add context about selected documents to the question
-        augmented_question = question
-        if selected_docs:
-            docs_list = ', '.join(selected_docs)
-            augmented_question = f"[Context: User has selected these documents: {docs_list}]\n\n{question}"
+            # Add context about selected documents to the question
+            augmented_question = question
+            if selected_docs:
+                docs_list = ', '.join(selected_docs)
+                augmented_question = f"[Context: User has selected these documents: {docs_list}]\n\n{question}"
 
-        async with agent.run_stream(
-            augmented_question, deps=deps, message_history=messages
-        ) as result:
-            async for message in result.stream_text(delta=True):
-                yield message
+            logger.info("Starting agent.run_stream...")
+            async with agent.run_stream(
+                augmented_question, deps=deps, message_history=messages
+            ) as result:
+                async for message in result.stream_text(delta=True):
+                    yield message
+            logger.info("Agent stream completed")
 
-        # After streaming completes, yield any generated images
-        if deps.generated_images:
-            yield {"images": deps.generated_images}
+            # After streaming completes, yield any generated images
+            if deps.generated_images:
+                yield {"images": deps.generated_images}
+    except Exception as e:
+        logger.error(f"Error in stream_messages: {e}")
+        logger.error(traceback.format_exc())
+        yield f"\n\n❌ Error: {e}"
 
 
 async def run_agent(question: str) -> None:

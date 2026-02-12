@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import logging
 import sys
 import time
 import warnings
@@ -9,10 +10,19 @@ from pathlib import Path
 import nest_asyncio
 import streamlit as st
 
-from src.agents.assistant_agent import stream_messages, update_memory
+# from src.agents.assistant_agent import stream_messages, update_memory
+from src.agents.orchestrator_agent import stream_orchestrated as stream_messages, update_memory
 from src.core.database import database_connect
 from src.preprocessing.document_parser import parse_document
 from src.preprocessing.document_processor import process_and_embed_document
+
+# Configure logging to show in console
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
 
 # Allow nested event loops (needed for Streamlit + async)
 nest_asyncio.apply()
