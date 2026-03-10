@@ -1,94 +1,63 @@
-# RAG App to Retrieve Information from a GitHub Repository
+# Chat RAG — Multi-Agent RAG Chatbot
 
-This repository consists of a simple RAG application to retrieve information about a GitHub repository, specifically [this one](https://github.com/lvgalvao/data-engineering-roadmap).
+A multi-agent RAG chatbot that lets you upload documents, search the web, and execute code — all through a conversational interface.
 
-It uses:
+## Stack
 
-- [PydanticAI](https://docs.pydantic.dev/latest/) as the agent framework.
-- PostgreSQL as the vector database, relying on [`pgvector`](https://github.com/pgvector/pgvector) and [`asyncpg`](https://magicstack.github.io/asyncpg/current/) libraries.
-- [OpenAI API](https://platform.openai.com/docs/overview) to generate the embeddings.
-- [Streamlit](https://streamlit.io/) to build the chat interface.
+- **Agent Framework**: [Pydantic AI](https://ai.pydantic.dev/)
+- **LLM Providers**: Azure OpenAI, OpenAI, Ollama, LM Studio
+- **Vector DB**: PostgreSQL + [pgvector](https://github.com/pgvector/pgvector)
+- **UI**: [Streamlit](https://streamlit.io/)
+- **Document Parsing**: [Docling](https://github.com/DS4SD/docling)
+- **Code Execution**: Sandboxed Python & Node.js executors
 
-Below is a quick demonstration of the chat running in Docker Compose, along with the PostgreSQL database. It queries files in two specific directories from the repository.
+## Agents
 
-![](media/rag-demo.gif)
+| Agent | Role |
+|---|---|
+| **Orchestrator** | Routes requests to specialized agents, plans tasks, enables parallel execution |
+| **Retrieval** | Semantic search over the knowledge base (cosine similarity) |
+| **Web** | Fetches webpages (Playwright/httpx), DuckDuckGo search, saves pages to KB |
+| **Code** | Executes Python/JS in sandboxed containers, captures output & plots |
+| **Reformulation** | Clarifies user questions, extracts URLs, fixes typos |
 
-## How it works
+## Supported Document Formats
 
-The data was extracted using [git ingest](https://gitingest.com/), which provides all the content of a repository in a TXT file.
+txt, pdf, md, json, csv, docx, pptx, xlsx, html, tsv
 
-To use as embeddings, the data was split into chunks of a maximum of 6000 tokens, while always maintaining the same root folder context. No overlap between chunks was applied.
+## How to Run
 
-In an attempt to give more context to the data, a preprocessing stage was done, where a preprocessing agent was created. Its function was to append a brief context describing the content of each chunk.
+Requires [Docker Compose](https://docs.docker.com/compose/install/).
 
-The cosine distance method was used to compare embeddings and retrieve relevant information.
-
-Although it serves as a simple way to implement a RAG using these tools, the overall performance of the RAG application in simple usage was poor, with constant hallucinations if general questions about the repository are asked. One of the possible causes is the chunk size of the files, as some words tend to give more weight to specific files when searching in the database, even with different combinations of other words.
-
-The process used for embedding and extracting the vectors was based on the PydanticAI [RAG documentation example](https://ai.pydantic.dev/examples/rag/), and the chat does not pass the message history to the model.
-
-![](media/diagram.png)
-
-## How to Run This Project
-
-This section shows how to run the project using Docker by building the two services together: the Chat interface and the PostgreSQL database.
-
-The Docker Compose setup includes an `entrypoint.sh` file, which runs the Python scripts responsible for creating the vector database. Be aware that it uses the OpenAI API key, which must be set in the `.env` file.
-
-[How to install Docker Compose](https://docs.docker.com/compose/install/)
-
-1 - Clone the repo locally:
+1. Clone and enter the repo:
 
 ```shell
 git clone https://github.com/lealre/rag-github-repo.git
-```
-
-2 - Access the project directory:
-
-```shell
 cd rag-github-repo
 ```
 
-3 - Create the `.env` file by renaming the `.env-example`:
+2. Create a `.env` file from the example and configure your LLM provider:
 
 ```shell
 mv .env-example .env
 ```
 
-Insert your API key in `OPENAI_API_KEY`.
+Key environment variables:
 
-4 - Build and start the container:
+| Variable | Default |
+|---|---|
+| `LLM_PROVIDER` | `openai` (azure, ollama, lmstudio) |
+| `LLM_API_KEY` | — |
+| `LLM_CHAT_MODEL` | `gpt-4o` |
+| `LLM_EMBEDDING_MODEL` | `text-embedding-3-small` |
+| `DATABASE_URL` | `postgres://admin:admin@localhost:5432/vector_db` |
+
+3. Start everything:
 
 ```shell
 docker compose up
 ```
 
-The application will be available at `http://localhost:8501/`.
+The app will be available at `http://localhost:8501/`.
 
-### Local commands
-
-The project uses [`uv`](https://docs.astral.sh/uv/) as the dependency manager.
-
-To chunk the data in `data/source.txt` and transform it into `data/data_chunks.json`, run the following command:
-
-```shell
-uv run -m src.preprocessing.chunk_splitter
-```
-
-To use the Agent to provide more context to the chunks and generate `data/final_data.json`, run:
-
-```shell
-uv run -m src.preprocessing.context_generator
-```
-
-To create the database table, run:
-
-```shell
-uv run -m src.core.database
-```
-
-To generate the embeddings in the database, run:
-
-```shell
-uv run -m src.embeddings
-```
+Services started: Streamlit UI, PostgreSQL (pgvector), Python executor, Node.js executor.
