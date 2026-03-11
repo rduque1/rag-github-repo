@@ -61,3 +61,15 @@ docker compose up
 The app will be available at `http://localhost:8501/`.
 
 Services started: Streamlit UI, PostgreSQL (pgvector), Python executor, Node.js executor.
+
+## Tested Local Setup
+
+Locally tested using [LM Studio](https://lmstudio.ai/) with the following configuration:
+
+```
+LLM_PROVIDER=lmstudio
+LLM_BASE_URL=http://host.docker.internal:1234/v1
+LLM_CHAT_MODEL=unsloth-qwen3-30b-a3b-instruct-2507-mlx
+LLM_EMBEDDING_MODEL=text-embedding-nomic-embed-text-v1.5
+LLM_EMBEDDING_DIMENSIONS=768
+```
