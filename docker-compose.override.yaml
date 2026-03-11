@@ -5,3 +5,11 @@ services:
       - ./data:/app/data
     environment:
       - STREAMLIT_SERVER_RUN_ON_SAVE=true
+
+  python-executor:
+    volumes:
+      - ./data:/app/data:ro
+
+  nodejs-executor:
+    volumes:
+      - ./data:/app/data:ro

@@ -23,11 +23,12 @@ Available packages: numpy, pandas, matplotlib, openpyxl, requests, httpx, pydant
 - Use print() for output
 - For plots: plt is pre-imported. Just create plot and call plt.show()
 - NEVER use plt.savefig() - figures are captured automatically
-- NEVER reference /mnt/data or file paths
+- Uploaded files are available at /app/data/ (e.g. pd.read_excel('/app/data/report.xlsx'))
 
 # JAVASCRIPT
-Available: path, url, querystring, util, crypto
+Available: path, url, querystring, util, crypto, fs (read-only on /app/data/)
 - Use console.log() for output
+- Uploaded files are available at /app/data/
 
 Always use code execution for calculations - never do mental math.
 """
@@ -55,11 +56,6 @@ async def execute_python_code(context: RunContext[Deps], code: str) -> str:
         r'plt\.savefig\([^)]*\)',
         '# savefig removed - figures are captured automatically',
         code
-    )
-    cleaned_code = re.sub(
-        r'["\'][^"\']*(/mnt/data|/tmp)[^"\']*["\']',
-        '"/dev/null"',
-        cleaned_code
     )
 
     try:

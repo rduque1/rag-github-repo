@@ -40,7 +40,7 @@ app.post('/execute', (req, res) => {
     },
     require: (mod) => {
       // Allow only safe built-in modules
-      const allowed = ['path', 'url', 'querystring', 'util', 'crypto'];
+      const allowed = ['path', 'url', 'querystring', 'util', 'crypto', 'fs'];
       if (allowed.includes(mod)) {
         return require(mod);
       }

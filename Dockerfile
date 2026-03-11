@@ -30,13 +30,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=docker.io/astral/uv:latest /uv /uvx /bin/
 
-ADD . /app
-
 WORKDIR /app
+
+# Copy only dependency files first for layer caching
+COPY pyproject.toml uv.lock ./
 
 RUN uv sync --frozen
 
 # Install Playwright browsers
 RUN uv run playwright install chromium
+
+# Now copy the rest of the source code
+COPY . .
 
 EXPOSE 8501

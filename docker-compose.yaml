@@ -11,6 +11,8 @@ services:
       - DATABASE_URL=${DATABASE_URL:-postgresql://admin:admin@postgres:5432/vector_db}
       - PYTHON_EXECUTOR_URL=http://python-executor:5000
       - NODEJS_EXECUTOR_URL=http://nodejs-executor:3000
+    volumes:
+      - shared_data:/app/data
     depends_on:
       - postgres
       - python-executor
@@ -37,6 +39,8 @@ services:
     restart: always
     ports:
       - "5000"
+    volumes:
+      - shared_data:/app/data:ro
     environment:
       - EXECUTION_TIMEOUT=60
 
@@ -48,8 +52,11 @@ services:
     restart: always
     ports:
       - "3000"
+    volumes:
+      - shared_data:/app/data:ro
     environment:
       - EXECUTION_TIMEOUT=60
 
 volumes:
   pgvector_data:
+  shared_data:
